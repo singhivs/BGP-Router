@@ -1,0 +1,593 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+from collections import defaultdict
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+    
+    def __init__(self, asn, connections):
+        self.updates = []
+        self.withdraws = []
+        self.routes = defaultdict(list)
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn # AS number for our router
+        
+        # for each router in the connection network
+        for relationship in connections:
+            # parse each neighboring router's info
+            port, neighbor, relation = relationship.split("-")
+            # create & setup unix socket for each neighboring router
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            # send handshake message to each of neighboring routers
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))    
+    
+    # send function
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+        
+    # message sent to neighbors in an update
+    def forwardToNeighbour(self, network, givenPacket):
+        msgUpdate = {
+            "src": self.our_addr(network),
+            "dst": network,
+            "type": "update",
+            "msg": {
+                "network": givenPacket["msg"]["network"],
+                "netmask": givenPacket["msg"]["netmask"],
+                "ASPath": [self.asn] + givenPacket["msg"]["ASPath"], 
+            }
+        }
+        self.send(network, json.dumps(msgUpdate))
+        
+    
+    # update function
+    def update(self, s, dataPacket):
+        self.updates.append(dataPacket)  # save packet in local
+        route = dataPacket["msg"]
+        self.routes[s].append(route)  # add route to forwarding table
+
+        rel = self.relations[s]
+        if rel == "cust":  # send to all neighbors
+            for network in self.sockets:
+                if network != s:
+                    self.forwardToNeighbour(network, dataPacket)
+        elif rel == "peer" or rel == "prov":  # send to customer only
+            for network in self.sockets:
+                if self.relations[network] == "cust":
+                    self.forwardToNeighbour(network, dataPacket)
+        return True
+    
+    # comparing attributes of two routes
+    def equateValues(self, r1, r2):
+        return r1["network"] == r2["network"] and r1["netmask"] == r2["netmask"] and r1["localpref"] == r2["localpref"] and r1["origin"] == r2["origin"] and r1["selfOrigin"] == r2["selfOrigin"] and (r1["ASPath"] == r2["ASPath"])
+    
+    # return True if a route exists in forwarding table
+    def ifRouteExists(self, l1, route):
+        bool = False
+        for i in l1:
+            listOfValue = l1[i]
+            for a in range(len(listOfValue)):
+                if (self.equateValues(listOfValue[a], route)):
+                    bool = True
+        return bool
+
+
+    # longest match
+    def longestMatch(self, dest):
+        listOfMatches = defaultdict(list)
+        # i is the key here
+        #finding the list of all possible matches
+        for i in self.routes:
+            listOfValue = self.routes[i]
+            for a in range(len(listOfValue)):
+                network = listOfValue[a]["network"]
+                netmask = listOfValue[a]["netmask"]    
+                appliedDest = self.applySubnet(netmask, dest)
+                appliedDestList = appliedDest.split(".")
+                networkList =  network.split(".")
+                if self.compareIP(appliedDestList, networkList):
+                    key = i
+                    value = listOfValue[a]
+                    listOfMatches[key].append(value)
+        # finding the longest match
+        x  = 1
+        key = ''
+        value = []
+        longestMatchList = defaultdict(list)
+        # i is key here
+        for i in listOfMatches:
+            newListOfValue = listOfMatches[i]
+            for a in range(len(newListOfValue)):
+                network = newListOfValue[a]["network"]
+                netmask = newListOfValue[a]["netmask"]  
+                netmaskInt = self.netmaskCalc(netmask)
+                if(x == 1):
+                    net = netmaskInt
+                    key = i
+                    value = newListOfValue[a]
+                elif netmaskInt > net:
+                    net = netmaskInt
+                    key = i
+                    value = newListOfValue[a]
+                elif netmaskInt == net:
+                    if not self.ifRouteExists(longestMatchList, value):
+                        longestMatchList[key].append(value)
+                    longestMatchList[i].append(newListOfValue[a])
+            x = x + 1
+
+        if not self.ifRouteExists(longestMatchList, value):
+            longestMatchList[key].append(value)
+        return longestMatchList
+         
+    # local pref
+    def localpref(self, dest):
+        longestMatch = self.longestMatch(dest)
+        local = 0
+        key = ''
+        value = []
+        localprefList = defaultdict(list)
+        for i in longestMatch:
+            listOfValue = longestMatch[i]
+            for a in range(len(listOfValue)):
+                localpref = listOfValue[a]["localpref"]
+                if(localpref > local):
+                    local = localpref
+                    key = i
+                    value = listOfValue[a]
+                elif localpref == local:
+                    if not self.ifRouteExists(localprefList, value):
+                        localprefList[key].append(value)
+                    localprefList[i].append(listOfValue[a]) 
+
+        if not self.ifRouteExists(localprefList, value):
+            localprefList[key].append(value)
+
+        return localprefList
+
+    # self origin
+    def selfOrigin(self, dest):
+        localprefList = self.localpref(dest)
+        key = ''
+        value = []
+        selfOriginList = defaultdict(list)
+        for i in localprefList:
+            listOfValue = localprefList[i]
+            for a in range(len(listOfValue)):
+                selfOrigin = listOfValue[a]["selfOrigin"]
+                if(selfOrigin):
+                    key = i
+                    value = listOfValue[a]
+                    selfOriginList[key].append(value)
+
+        if(len(selfOriginList) == 0):
+            return localprefList
+        else:
+            return selfOriginList
+    
+    # AS path
+    def asPath(self, dest):
+        selfOrigin = self.selfOrigin(dest)
+        key = ''
+        asPath = []
+        value = []
+        x  = 1
+        ASPathList = defaultdict(list)
+        for i in selfOrigin:
+            listOfValue = selfOrigin[i]
+            for a in range(len(listOfValue)):
+                ASPath = listOfValue[a]["ASPath"]
+                if(x == 1):
+                    asPath = ASPath
+                    key = i
+                    value = listOfValue[a]
+                elif(len(ASPath) < len(asPath)):
+                    asPath = ASPath
+                    key = i
+                    value = listOfValue[a]
+                elif len(ASPath) == len(asPath):
+                    if not self.ifRouteExists(ASPathList, value):   
+                        ASPathList[key].append(value)
+                    ASPathList[i].append(listOfValue[a])
+            x += 1 
+
+        if not self.ifRouteExists(ASPathList, value):        
+            ASPathList[key].append(value)
+        return ASPathList
+
+    # best origin
+    def bestOrigin(self, dest):
+        asPath = self.asPath(dest)
+        key = ''
+        value = []
+        origin1 = 0
+        x = 1
+        bestOriginList = defaultdict(list)
+        value = {"IGP": 3, "EGP": 2, "UNK": 1}
+        for i in asPath:
+            listOfValue = asPath[i]
+            for a in range(len(listOfValue)):
+                origin = listOfValue[a]["origin"]
+                if origin == "IGP":
+                    origin = 3
+                elif origin == "EGP":
+                    origin = 2
+                else:
+                    origin = 1
+                
+                if(x == 1):
+                    origin1 = origin
+                    key = i
+                    value = listOfValue[a]
+                elif origin > origin1:
+                    origin1 = origin
+                    key = i
+                    value = listOfValue[a]
+                elif origin == origin1: 
+                    if(value not in bestOriginList.values()):
+                        bestOriginList[key].append(value)
+                        bestOriginList[i].append(listOfValue[a])
+            x += 1
+        
+        if(value not in bestOriginList.values()):        
+            bestOriginList[key].append(value) 
+        return bestOriginList
+    
+    # function to find the smaller ip address
+    def compIP(self, ip1, ip2):
+        ip_start = list(map(int, ip1.split('.')))
+        ip_end =  list(map(int, ip2.split('.')))
+        return ip_start < ip_end
+    
+    def lowestIP(self, dest):
+        bestOrigin = self.bestOrigin(dest)
+        a = ''
+        src_list = list(bestOrigin.keys())
+        for i in range(len(src_list)):
+            if(i == 0):
+                a = src_list[0]
+            elif self.compIP(src_list[i], a):
+                a = src_list[i]
+        return a
+
+    # given an IP address and netmask it applies the netmask to the IP address
+    def applySubnet(self, netmask, ip):
+        appliedDest = ".".join(map(str, [i & m 
+                            for i,m in zip(map(int, ip.split(".")),
+                                map(int, netmask.split(".")))]))
+        return appliedDest
+    
+    def compareIP(self, l1, l2):
+        for i in range(len(l1)):
+           if ((int(l1[i]) ^ int(l2[i])) != 0):
+            return False
+        return True
+    
+    # data function
+    def data(self, scrif, p):
+        dest = p['dst']
+        if(len(self.longestMatch(dest)) == 1):
+            longestMatchKeys = list(self.longestMatch(dest).keys())
+            msg = {
+                "src":  self.our_addr(scrif),       
+                "dst":  dest,  
+                "type": "data",                   
+                "msg":  self.longestMatch(dest)
+                }
+            if(self.relations[scrif] == "cust" or self.relations[longestMatchKeys[0]] == "cust"):
+                self.send(longestMatchKeys[0], json.dumps(msg))
+            else:
+                self.noRouteMsg(scrif, dest)
+
+        elif(len(self.localpref(dest)) == 1):
+            localprefKeys = list(self.localpref(dest).keys())
+            msg = {
+                "src":  self.our_addr(scrif),       
+                "dst":  dest,  
+                "type": "data",                   
+                "msg": {}
+                }
+            if(self.relations[scrif] == "cust" or self.relations[localprefKeys[0]] == "cust"):
+                self.send(localprefKeys[0], json.dumps(msg))
+            else:
+                self.noRouteMsg(scrif, dest)
+        
+        elif(len(self.selfOrigin(dest)) == 1):
+            selfOriginKeys = list(self.selfOrigin(dest).keys())
+            msg = {
+                "src":  self.our_addr(scrif),       
+                "dst":  dest,  
+                "type": "data",                   
+                "msg":  {}
+                }
+            if(self.relations[scrif] == "cust" or self.relations[selfOriginKeys[0]] == "cust"):
+                self.send(selfOriginKeys[0], json.dumps(msg))
+            else:
+                self.noRouteMsg(scrif, dest)
+        
+        elif(len(self.asPath(dest)) == 1):           
+            selfASPathKeys = list(self.asPath(dest).keys())
+            msg = {
+                "src":  self.our_addr(scrif),       
+                "dst":  dest,  
+                "type": "data",                   
+                "msg":  {}
+                }
+            if(self.relations[scrif] == "cust" or self.relations[selfASPathKeys[0]] == "cust"):
+                self.send(selfASPathKeys[0], json.dumps(msg))
+            else:
+                self.noRouteMsg(scrif, dest) 
+
+        elif(len(self.bestOrigin(dest)) == 1):      
+            selfOriginKeys = list(self.bestOrigin(dest).keys())
+            msg = {
+                "src":  self.our_addr(scrif),       
+                "dst":  dest,  
+                "type": "data",                   
+                "msg":  {}
+                }
+            if(self.relations[scrif] == "cust" or self.relations[selfOriginKeys[0]] == "cust"):
+                self.send(selfOriginKeys[0], json.dumps(msg))
+            else:
+                self.noRouteMsg(scrif, dest)
+
+        elif(self.lowestIP(dest) is not None):          
+            msg = {
+                "src":  self.our_addr(scrif),       
+                "dst":  dest,  
+                "type": "data",                   
+                "msg":  {}
+                }
+            if(self.relations[scrif] == "cust" or self.relations[self.lowestIP(dest)] == "cust"):
+                self.send(self.lowestIP(dest), json.dumps(msg))
+            else:
+                self.noRouteMsg(scrif, dest) 
+
+        else:
+            self.noRouteMsg(scrif, dest)  
+
+    # no route in forwarding table message
+    def noRouteMsg(self, scrif, dest):
+        msg = {
+                "src":  self.our_addr(scrif),       
+                "dst":  dest,  
+                 "type": "no route",                   
+                 "msg":  {}
+                }
+        self.send(scrif, json.dumps(msg))    
+    
+    # true if two routes have the same attributes
+    def same_attributes(self, r1, r2):
+        return r1["localpref"] == r2["localpref"] and r1["origin"] == r2["origin"] and r1["selfOrigin"] == r2["selfOrigin"] and (r1["ASPath"] == r2["ASPath"])
+    
+    # true if two routes are adjacent to each other
+    def adjacent(self, r1, r2):
+        if r1["netmask"] != r2["netmask"]: # if two routes have different netmasks, return false
+            return False
+        
+        netmask_ones = self.netmaskCalc(r1["netmask"])
+        network_binary_r1 = "".join(["{:08b}".format(int(x)) for x in r1["network"].split(".")]) # convert network to binary
+        network_binary_r2 = "".join(["{:08b}".format(int(x)) for x in r2["network"].split(".")]) 
+        
+        # true if they have same network bit with 1 as netmask
+        return network_binary_r1[:netmask_ones - 1] == network_binary_r2[:netmask_ones - 1]
+        
+    # calculate the number of 1's in netmask
+    def netmaskCalc(self, netmask):
+         netmask_binary = "".join(["{:08b}".format(int(x))for x in netmask.split(".")])
+         netmask_ones = netmask_binary.count("1")
+         return netmask_ones
+        
+    # generates a new netmask for aggregated routes
+    def create_net_mask(self, r):
+        bi = [128, 64, 32, 16, 8, 4, 2, 1]
+        netmask_len = self.netmaskCalc(r["netmask"]) - 1
+        new_netmask = []
+        while netmask_len != 0:
+            if netmask_len - 8 >= 0:
+                new_netmask.append("255")
+                netmask_len -= 8
+            else:
+                bit = 256 - bi[netmask_len - 1]
+                new_netmask.append(str(bit))
+                break
+        if len(new_netmask) < 4:
+            new_netmask.append("0")
+        return ".".join(new_netmask)
+        
+    # return route with new netmask
+    def aggregate_routes(self, r1, r2):
+        new_netmask = self.create_net_mask(r1)
+        route = {
+            "network": r1["network"],
+            "netmask": new_netmask,
+            "localpref": r1["localpref"],
+            "selfOrigin": r1["selfOrigin"],
+            "ASPath": r1["ASPath"],
+            "origin": r1["origin"]
+        }
+        return route
+        
+    # return route with larger network ip
+    def largerIP(self, ip1, ip2):
+        ip1_list = ip1.split(".")
+        ip2_list = ip2.split(".")
+        
+        for i1, i2 in zip(reversed(ip1_list), reversed(ip2_list)):
+            if int(i1) > int(i2):
+                return ip1
+            elif int(i1) < int(i2):
+                return ip2
+            else: 
+                continue
+        return True
+     
+    # aggregate function
+    def aggregate(self):
+        forwarding_table = self.routes
+        
+        for r in forwarding_table: #for each peer
+            curr_route = forwarding_table[r] #list of routes
+            
+            for r1 in curr_route:
+                for r2 in curr_route:  # for the rest of entries in forwarding table [1, 2, ...]
+                    if self.equateValues(r1, r2): continue #referring to the same route
+                    if self.adjacent(r1, r2) and self.same_attributes(r1, r2):  # if aggregatable
+                        forwarding_table[r].remove(r1)  
+                        forwarding_table[r].remove(r2)
+
+                        if r2["network"] == self.largerIP(r1["network"], r2["network"]):  #remove route with larger ip
+                            forwarding_table[r].append(self.aggregate_routes(r1, r2))
+                            curr_route.append(self.aggregate_routes(r1, r2))
+                        else:
+                            forwarding_table[r].append(self.aggregate_routes(r2, r1))
+                            curr_route.append(self.aggregate_routes(r2, r1))
+                            
+                        #curr_route = forwarding_table[r]
+                        break
+          
+        return forwarding_table
+    
+    # dump function
+    def dump(self, packet):
+        aggregated_routes = self.aggregate()
+        aggregated_routes1 = self.aggregate()
+        #print("aggregated routes: " + json.dumps(aggregated_routes))
+        info = []
+        
+        a = 0
+        for i in aggregated_routes:
+            sub_routes = aggregated_routes[i]
+            lok = list(aggregated_routes.keys())
+            for k in range(len(sub_routes)):
+                info.append({
+                    "network": aggregated_routes[i][k]["network"],
+                    "netmask": aggregated_routes[i][k]["netmask"],
+                    "peer": lok[a],
+                    "localpref": aggregated_routes[i][k]["localpref"],
+                    "ASPath": aggregated_routes[i][k]["ASPath"],
+                    "selfOrigin": aggregated_routes[i][k]["selfOrigin"],
+                    "origin": aggregated_routes[i][k]["origin"]
+                })
+            a += 1
+        
+        msgTable = {
+            "src": packet["dst"],
+            "dst": packet["src"],
+            "type": "table",
+            "msg": info
+        }
+        self.send(packet["src"], json.dumps(msgTable))
+    
+    # send withdraw message to neighbors
+    def withdrawFromNeighbor(self, network, packet):
+        msgWithdraw = {
+            "src": self.our_addr(network),
+            "dst": network,
+            "type": "withdraw",
+            "msg":  packet["msg"]
+        }
+        self.send(network, json.dumps(msgWithdraw))
+    
+    def equate(self, r1, r2):
+        return r2['network'] == r1['network'] and r2['netmask'] == r1['netmask']
+    
+    def ifRouteExistsInList(self, l1, route):
+        bool = False
+        for i in range(len(l1)):
+            if(dict(l1[i])['src'] == dict(route)['src'] and dict(l1[i])['dst'] == dict(route)['dst']):
+                listofValue = l1[i]['msg']
+                for a in range(len(listofValue)):
+                    if (self.equate(listofValue[a], dict(route)['msg'])):
+                        bool = True
+        return bool
+
+    # throw away the original forwarding table and rebuild from saved messages
+    def disaggregate(self):
+        new_routes = []
+        for r in self.updates:
+            if not self.ifRouteExistsInList(self.withdraws, r):
+                print("TRUWEEEEEE")
+                new_routes.append(r)
+        self.routes = defaultdict(list)
+        print(self.withdraws)
+        print("new routes")
+        print(new_routes)
+        for nr in new_routes:
+            route = nr["msg"]
+            self.routes[nr["src"]].append(route)
+        
+    # withdraw function
+    def withdraw(self, srcif, packet):
+        self.withdraws.append(packet)
+        
+        self.disaggregate()
+        print("new forwarding table: " + json.dumps(self.routes))
+        
+        routes_to_withdraw = packet["msg"]  #received from source
+        src_to_withdraw = packet["src"]  # source called withdraw
+        orig_routes = self.routes
+        withdraw_list = orig_routes[src_to_withdraw]
+        
+        # remove withdrawn routes from forwarding table
+        for r1, r2 in zip(routes_to_withdraw, withdraw_list):
+            if r1["network"] == r2["network"] and r1["netmask"] == r2["netmask"]:
+                print(r2)
+                orig_routes.pop(packet["src"])
+        rel = self.relations[srcif]
+        if rel == "cust":
+            for network in self.sockets:
+                if network != srcif:
+                    self.withdrawFromNeighbor(network, packet)
+        elif rel == "peer" or rel == "prov":
+            for network in self.sockets:
+                if self.relations[network] == "cust":
+                    self.withdrawFromNeighbor(network, packet)
+        return True
+    
+    # handles the type of the packet
+    def type(self, srcif, p):
+        if p["type"] == "data":
+            return self.data(srcif, p)
+        elif p["type"] == "update":
+            return self.update(srcif, p)
+        elif p["type"] == "dump":
+            return self.dump(p)
+        elif p["type"] == "withdraw":
+            return self.withdraw(srcif, p)
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    # main function for the router
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                if k:
+                    for sock in self.sockets:
+                        if self.sockets[sock] == conn:
+                            srcif = sock
+                    msg = json.loads(k.decode('utf-8'))
+                    print("Received message '%s' from %s" % (msg, srcif))
+                    self.type(srcif, msg)
+                else:
+                    return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
